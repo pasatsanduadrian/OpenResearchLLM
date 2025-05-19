@@ -1,0 +1,9 @@
+flask
+pyngrok
+nest_asyncio
+python-dotenv
+mistralai
+google-genai
+aiohttp
+beautifulsoup4
+duckduckgo_search
