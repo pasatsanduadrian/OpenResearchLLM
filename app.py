@@ -1,7 +1,9 @@
 import os
+import time
 import asyncio
+import threading
 import nest_asyncio
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request
 from pyngrok import ngrok
 from dotenv import load_dotenv
 from mistralai import Mistral
@@ -23,18 +25,46 @@ NGROK_HOSTNAME = os.getenv("NGROK_HOSTNAME", None)
 GEMINI_MODEL = "gemini-2.0-flash"
 MISTRAL_MODEL = "mistral-large-latest"
 
+# --- Rate Limiters ---
+class RateLimiter:
+    def __init__(self, min_interval_s):
+        self.min_interval_s = min_interval_s
+        self.last_call = 0
+        self.lock = threading.Lock()
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.min_interval_s:
+                time.sleep(self.min_interval_s - elapsed)
+            self.last_call = time.time()
+
+class AsyncRateLimiter:
+    def __init__(self, min_interval_s):
+        self.min_interval_s = min_interval_s
+        self._last_call = 0
+    async def wait(self):
+        now = time.time()
+        elapsed = now - self._last_call
+        if elapsed < self.min_interval_s:
+            await asyncio.sleep(self.min_interval_s - elapsed)
+        self._last_call = time.time()
+
+gemini_async_limiter = AsyncRateLimiter(4.0)    # 15 RPM = 4s
+mistral_async_limiter = AsyncRateLimiter(1.0)   # 1s pentru siguranță
+
 # --- Init LLM clients ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 
-# --- Helper: standard prompt
 def combine_messages(messages):
     return "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages])
 
-# --- LLM Fallback ---
+# --- LLM Fallback, cu rate limit ---
 async def call_llm(messages):
     prompt = combine_messages(messages)
     try:
+        await gemini_async_limiter.wait()
         resp = await asyncio.to_thread(
             gemini_client.models.generate_content,
             model=GEMINI_MODEL,
@@ -48,6 +78,7 @@ async def call_llm(messages):
     except Exception as e:
         print("[Fallback] Gemini failed, try Mistral:", e)
         try:
+            await mistral_async_limiter.wait()
             mistral_resp = await asyncio.to_thread(
                 mistral_client.chat.complete,
                 model=MISTRAL_MODEL,
@@ -70,8 +101,10 @@ async def generate_search_queries(user_query):
         {"role": "user", "content": f"User Query: {user_query}\n\n{prompt}"}
     ]
     response = await call_llm(messages)
+    # Elimina orice delimitator de tip ```python sau ``` de la LLM
+    clean = response.strip().replace('```python', '').replace('```', '').strip()
     try:
-        queries = eval(response.strip().replace('```', ''))
+        queries = eval(clean)
         if isinstance(queries, list):
             return queries
         else:
@@ -131,8 +164,9 @@ async def get_new_search_queries(user_query, previous_search_queries, all_contex
     response = await call_llm(messages)
     if response.strip() == "<done>":
         return "<done>"
+    clean = response.strip().replace('```python', '').replace('```', '').strip()
     try:
-        queries = eval(response.strip().replace('```', ''))
+        queries = eval(clean)
         if isinstance(queries, list):
             return queries
     except Exception:
@@ -144,7 +178,9 @@ async def generate_final_report(user_query, all_contexts):
     prompt = (
         "You are an expert researcher and report writer. Based on the gathered contexts below and the original query, "
         "write a comprehensive, well-structured, and detailed report that addresses the query thoroughly. "
-        "Include all relevant insights and conclusions without extraneous commentary."
+        "Use markdown for all sections: Title, Executive Summary, numbered sections, bullet lists, bold, tables if needed. "
+        "Each section (title, executive summary, introduction, main sections, conclusion) must be in its own markdown block for easy HTML parsing. "
+        "Return only markdown, no code fences or explanations."
     )
     messages = [
         {"role": "system", "content": "You are a skilled report writer."},
@@ -220,7 +256,23 @@ async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
         if progress_cb: progress_cb(progress)
     return {"progress": progress, "report": report}
 
-# --- Flask Web UI (progress, live polling, etc.) ---
+# --- HTML vizual pentru raport (format markdown split pe secțiuni) ---
+def format_report_html(markdown_text):
+    import re
+    from markdown import markdown
+    # Sparge pe secțiuni principale (titlu, summary, etc) dacă există "#", "##", etc.
+    sections = re.split(r"(?m)^#+ ", markdown_text)
+    headers = re.findall(r"(?m)^#+ (.+)$", markdown_text)
+    blocks = []
+    for idx, sec in enumerate(sections):
+        if not sec.strip():
+            continue
+        title = headers[idx-1] if idx > 0 and idx-1 < len(headers) else None
+        if title:
+            blocks.append(f"<h3 class='mt-4 mb-2'>{title}</h3>")
+        blocks.append(f"<div class='report-section mb-3'>{markdown(sec.strip())}</div>")
+    return "\n".join(blocks)
+
 app = Flask(__name__)
 TASKS = {}
 
@@ -231,15 +283,15 @@ FORM_HTML = """
 <title>LLM Research Web App</title>
 <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
 <style>
-body {{background:#f8f9fa;}}
-.card {{margin:50px auto; max-width:650px;}}
-#progressBox {{background:#212529;color:#fff;padding:12px 16px;border-radius:6px;margin-top:1rem;display:none}}
+body {background:#f7f8fa;}
+.card {margin:50px auto; max-width:700px;}
+#progressBox {background:#23272b;color:#fff;padding:12px 16px;border-radius:8px;margin-top:1.5rem;display:none}
 </style>
 </head>
 <body>
-<div class="card">
+<div class="card shadow">
  <div class="card-body">
-   <h3 class="card-title mb-4">Research Web Assistant (Gemini & Mistral)</h3>
+   <h2 class="card-title mb-4">Research Web Assistant (Gemini & Mistral)</h2>
    <form id="main-form" method="POST" action="/start">
      <div class="form-group">
        <label for="query">Your research query / topic</label>
@@ -255,10 +307,10 @@ body {{background:#f8f9fa;}}
  </div>
 </div>
 <script>
-document.getElementById('main-form').onsubmit = function() {{
+document.getElementById('main-form').onsubmit = function() {
   document.getElementById('progressBox').style.display = "block";
   document.getElementById('progressBox').innerHTML = "Starting...";
-}};
+};
 </script>
 </body>
 </html>
@@ -270,25 +322,32 @@ RESULT_HTML = """
 <head>
 <title>Research Report</title>
 <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-<style>body{{background:#f8f9fa;}}</style>
+<style>
+body{background:#f7f8fa;}
+.card{margin-top:40px;}
+.report-section {background:#fff;border-radius:7px;box-shadow:0 0 8px #dbe3ea;padding:18px;margin-bottom:1rem;}
+h2, h3 {color:#274690;}
+pre {background: #eef2fb;}
+</style>
 </head>
 <body>
 <div class="container mt-5">
-  <div class="card"><div class="card-body">
+  <div class="card shadow"><div class="card-body">
     <h4>Query:</h4>
     <p><b>{{ query }}</b></p>
     <h5>Progress:</h5>
     <ul>{% for item in progress %}<li>{{item}}</li>{% endfor %}</ul>
-    <h5>Report:</h5>
-    <pre style="white-space:pre-wrap;">{{ report }}</pre>
-    <a href="/" class="btn btn-link">New research</a>
+    <h4 class="mt-4 mb-3">Research Report</h4>
+    <div id="report">
+      {{ report_html|safe }}
+    </div>
+    <a href="/" class="btn btn-link mt-3">New research</a>
   </div></div>
 </div>
 </body>
 </html>
 """
 
-# --- Web endpoints ---
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(FORM_HTML)
@@ -308,7 +367,7 @@ def start():
         TASKS[task_id]["done"] = True
         TASKS[task_id]["result"] = result
     loop.create_task(run_task())
-    loop.call_soon_threadsafe(lambda: None)  # make sure loop is running
+    loop.call_soon_threadsafe(lambda: None)
     return render_template_string("""
       <html><head>
       <meta http-equiv="refresh" content="1; URL=/progress?task_id={{task_id}}">
@@ -325,7 +384,6 @@ def progress():
     if not info:
         return "Task not found."
     if not info["done"]:
-        # Progress only
         return render_template_string("""
             <html><head>
             <meta http-equiv="refresh" content="2; URL=/progress?task_id={{task_id}}">
@@ -336,14 +394,14 @@ def progress():
             <div>(refreshing...)</div>
             </body></html>
         """, progress=info["progress"], task_id=task_id)
-    # Task complete
     result = info["result"]
+    report_html = format_report_html(result["report"])
+    # User query nu e transmis aici, îl punem blank ca să nu fie None
     return render_template_string(RESULT_HTML,
         query=request.form.get("query", ""),
         progress=result["progress"],
-        report=result["report"])
+        report_html=report_html)
 
-# --- ngrok runner ---
 def start_ngrok(app, port):
     if NGROK_TOKEN:
         ngrok.set_auth_token(NGROK_TOKEN)
