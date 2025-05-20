@@ -352,22 +352,24 @@ pre {background: #eef2fb;}
 def index():
     return render_template_string(FORM_HTML)
 
+from functools import partial
+
 @app.route("/start", methods=["POST"])
 def start():
     user_query = request.form.get("query", "").strip()
     iter_limit = int(request.form.get("iterations", 2))
     task_id = str(hash(user_query + str(iter_limit)))
-    TASKS[task_id] = {"progress": [], "done": False, "result": ""}
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    TASKS[task_id] = {"progress": [], "done": False, "result": "", "query": user_query}
     def progress_cb(proglist):
         TASKS[task_id]["progress"] = proglist.copy()
-    async def run_task():
-        result = await full_research_pipeline(user_query, iter_limit, progress_cb)
+    # Rulează research pipeline pe un thread separat (nu în event loop Flask!)
+    def background_run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(full_research_pipeline(user_query, iter_limit, progress_cb))
         TASKS[task_id]["done"] = True
         TASKS[task_id]["result"] = result
-    loop.create_task(run_task())
-    loop.call_soon_threadsafe(lambda: None)
+    threading.Thread(target=background_run, daemon=True).start()
     return render_template_string("""
       <html><head>
       <meta http-equiv="refresh" content="1; URL=/progress?task_id={{task_id}}">
@@ -376,6 +378,7 @@ def start():
       <div style='margin:2em'>Task started. Loading progress page...</div>
       </body></html>
       """, task_id=task_id)
+
 
 @app.route("/progress")
 def progress():
@@ -396,9 +399,8 @@ def progress():
         """, progress=info["progress"], task_id=task_id)
     result = info["result"]
     report_html = format_report_html(result["report"])
-    # User query nu e transmis aici, îl punem blank ca să nu fie None
     return render_template_string(RESULT_HTML,
-        query=request.form.get("query", ""),
+        query=info.get("query", ""),
         progress=result["progress"],
         report_html=report_html)
 
