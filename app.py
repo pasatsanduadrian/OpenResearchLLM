@@ -3,7 +3,7 @@ import time
 import asyncio
 import threading
 import nest_asyncio
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, send_file
 from pyngrok import ngrok
 from dotenv import load_dotenv
 from mistralai import Mistral
@@ -11,11 +11,19 @@ from google import genai
 import aiohttp
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
+import io
+import re
+from markdown import markdown
+
+try:
+    from weasyprint import HTML
+except ImportError:
+    HTML = None # Warn if WeasyPrint is missing at runtime
 
 nest_asyncio.apply()
 load_dotenv()
 
-# --- Config ---
+# --- Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 PORT = int(os.getenv("PORT", "5099"))
@@ -30,6 +38,7 @@ class AsyncRateLimiter:
     def __init__(self, min_interval_s):
         self.min_interval_s = min_interval_s
         self._last_call = 0
+
     async def wait(self):
         now = time.time()
         elapsed = now - self._last_call
@@ -37,17 +46,17 @@ class AsyncRateLimiter:
             await asyncio.sleep(self.min_interval_s - elapsed)
         self._last_call = time.time()
 
-gemini_async_limiter = AsyncRateLimiter(4.0)    # 15 RPM = 4s
-mistral_async_limiter = AsyncRateLimiter(1.0)   # 1s pentru siguranță
+gemini_async_limiter = AsyncRateLimiter(4.0) # Approx. 15 RPM for Gemini-2.0-Flash
+mistral_async_limiter = AsyncRateLimiter(1.0) # Safer rate for Mistral
 
-# --- Init LLM clients ---
+# --- Initialize LLM clients ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 
 def combine_messages(messages):
     return "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages])
 
-# --- LLM Fallback, cu rate limit ---
+# --- LLM Fallback with Rate Limiting ---
 async def call_llm(messages):
     prompt = combine_messages(messages)
     try:
@@ -63,7 +72,7 @@ async def call_llm(messages):
         else:
             raise Exception("Empty Gemini reply")
     except Exception as e:
-        print("[Fallback] Gemini failed, try Mistral:", e)
+        print(f"[Fallback] Gemini failed, attempting Mistral: {e}")
         try:
             await mistral_async_limiter.wait()
             mistral_resp = await asyncio.to_thread(
@@ -73,19 +82,18 @@ async def call_llm(messages):
             )
             return mistral_resp.choices[0].message.content.strip()
         except Exception as ex:
-            print("[Error] Both LLMs failed:", ex)
+            print(f"[Error] Both LLMs failed: {ex}")
             return "Error: Both LLMs failed."
 
-# --- Async research pipeline ---
-async def generate_search_queries(user_query):
+# --- Asynchronous Research Pipeline ---
+async def generate_search_queries(user_query, search_lang):
     prompt = (
-        "You are an expert research assistant. Given the user's query, generate up to four distinct, "
-        "precise search queries that would help gather comprehensive information on the topic. "
-        "Return only a Python list of strings, for example: ['query1', 'query2']."
+        f"Ești un asistent de cercetare. Pentru întrebarea utilizatorului, generează până la patru interogări precise pentru web, în limba: {search_lang}."
+        "\nRăspunde doar cu o listă Python de stringuri, exemplu: ['query1', 'query2']."
     )
     messages = [
-        {"role": "system", "content": "You are a helpful and precise research assistant."},
-        {"role": "user", "content": f"User Query: {user_query}\n\n{prompt}"}
+        {"role": "system", "content": "Ești un asistent util și precis."},
+        {"role": "user", "content": f"Întrebare: {user_query}\n\n{prompt}"}
     ]
     response = await call_llm(messages)
     clean = response.strip().replace('```python', '').replace('```', '').strip()
@@ -119,15 +127,14 @@ async def fetch_text(session, url):
         return ""
     return ""
 
-async def evaluate_and_extract(user_query, search_query, page_text):
+async def evaluate_and_extract(user_query, search_query, page_text, report_lang):
     prompt = (
-        "You are an expert evaluator. Given the user query and webpage content below, first determine if "
-        "the webpage is useful. If it is useful, extract and return all relevant context as plain text. "
-        "If not useful, reply exactly: Not Useful."
+        f"Ești evaluator. Pentru întrebarea '{user_query}' și pagina web de mai jos, evaluează dacă e utilă. Dacă DA, extrage contextul relevant ca text simplu, răspunzând doar în limba: {report_lang}. "
+        "Dacă nu e utilă, răspunde exact: Not Useful."
     )
     messages = [
-        {"role": "system", "content": "You are a concise and expert evaluator and extractor."},
-        {"role": "user", "content": f"User Query: {user_query}\nSearch Query: {search_query}\n\nWebpage Content (first 20000 chars):\n{page_text[:20000]}\n\n{prompt}"}
+        {"role": "system", "content": "Ești evaluator și extractor concis."},
+        {"role": "user", "content": f"Întrebare: {user_query}\nCăutare: {search_query}\n\nConținut pagină (primele 20000 caractere):\n{page_text[:20000]}\n\n{prompt}"}
     ]
     resp = await call_llm(messages)
     cleaned = resp.strip().replace("```", "")
@@ -135,17 +142,15 @@ async def evaluate_and_extract(user_query, search_query, page_text):
         return None
     return cleaned
 
-async def get_new_search_queries(user_query, previous_search_queries, all_contexts):
+async def get_new_search_queries(user_query, previous_search_queries, all_contexts, search_lang):
     context_combined = "\n".join(all_contexts)
     prompt = (
-        "You are an analytical research assistant. Based on the original query, the search queries performed so far, "
-        "and the extracted contexts from webpages, determine if further research is needed. "
-        "If further research is needed, provide up to four new search queries as a Python list (e.g. ['q1','q2']). "
-        "If no further research is needed, respond with exactly <done>."
+        f"Ești un planificator analitic. Pe baza interogărilor de până acum (în {search_lang}) și a contextelor extrase, vezi dacă e nevoie de alte căutări. "
+        "Dacă DA, propune până la patru noi interogări ca listă Python. Dacă NU, răspunde cu exact <done>."
     )
     messages = [
-        {"role": "system", "content": "You are a systematic research planner."},
-        {"role": "user", "content": f"User Query: {user_query}\nPrevious Search Queries: {previous_search_queries}\n\nExtracted Contexts:\n{context_combined}\n\n{prompt}"}
+        {"role": "system", "content": "Planificator sistematic."},
+        {"role": "user", "content": f"Întrebare: {user_query}\nCăutări precedente: {previous_search_queries}\n\nContext extras:\n{context_combined}\n\n{prompt}"}
     ]
     response = await call_llm(messages)
     if response.strip() == "<done>":
@@ -159,51 +164,50 @@ async def get_new_search_queries(user_query, previous_search_queries, all_contex
         pass
     return []
 
-async def generate_final_report(user_query, all_contexts, context_sources):
-    # Integrează referințe în raport cu [n] și listă la final
-    context_refs = {}
-    bib_lines = []
-    for idx, src in enumerate(context_sources):
-        ref_num = idx+1
-        context_refs[src] = ref_num
-        bib_lines.append(f"[{ref_num}] {src}")
-    # Adaugă prompt explicit pentru citări și referințe
+async def generate_final_report(user_query, all_contexts, report_lang, context_sources):
+    # Prepare bibliography lines for the LLM
+    bib_lines = [f"[{i+1}] {src}" for i, src in enumerate(context_sources)] if context_sources else []
+
+    # Prompt for LLM to generate structured report with inline citations and a bibliography
     prompt = (
-        "You are an expert researcher and report writer. Based on the gathered contexts below and the original query, "
-        "write a comprehensive, well-structured, and detailed report that addresses the query thoroughly. "
-        "Cite sources in-line as [n] where relevant (see context source URLs below). At the end, include a section 'Bibliografie' as a markdown bullet list with one line per reference (in format [n] url)."
-        "Use markdown for all sections: Title, Executive Summary, numbered sections, bullet lists, bold, tables if needed. "
-        "Each section (title, executive summary, introduction, main sections, conclusion) must be in its own markdown block for easy HTML parsing. "
-        "Return only markdown, no code fences or explanations."
-        "\n\nContext sources:\n" + "\n".join(bib_lines)
+        f"Ești un cercetător și redactor. Pe baza contextului și a întrebării, scrie un raport structurat, cu secțiuni markdown: Titlu, Rezumat executiv, Introducere, Secțiuni principale (cel puțin 2, detaliate), Concluzie. "
+        f"Redactează clar, formal, EXCLUSIV în limba: {report_lang}. "
+        "Citează sursele în linie folosind formatul [n], unde 'n' este numărul din lista de referințe de mai jos. "
+        "Asigură-te că fiecare citare corespunde unei referințe relevante din text. "
+        "La final, include o secțiune 'Bibliografie' formatată ca o listă cu marcatori (bullet list), o linie per referință, în formatul [n] URL."
+        "Folosește formatare Markdown pentru a îmbunătăți lizibilitatea (ex: bold, liste, tabele dacă este cazul). "
+        "Fiecare secțiune (Titlu, Rezumat executiv, Introducere, Secțiuni principale, Concluzie, Bibliografie) trebuie să fie un bloc Markdown separat pentru o parsare ușoară în HTML."
+        "NU include delimitatori de tipul ``` sau code fence în afara blocurilor de cod Markdown dacă sunt absolut necesare."
+        "\n\nReferințe pentru context (folosește numerele pentru citare):\n" + "\n".join(bib_lines)
     )
+    context_combined = "\n".join(all_contexts)
     messages = [
-        {"role": "system", "content": "You are a skilled report writer."},
-        {"role": "user", "content": f"User Query: {user_query}\n\nContexts:\n{chr(10).join(all_contexts)}\n\n{prompt}"}
+        {"role": "system", "content": "Redactor raport profesionist și precis."},
+        {"role": "user", "content": f"Întrebare: {user_query}\n\nContext:\n{context_combined}\n\n{prompt}"}
     ]
     return await call_llm(messages)
 
-# --- Async research orchestrator ---
-async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
+# --- Asynchronous Research Orchestrator ---
+async def full_research_pipeline(user_query, iter_limit, search_lang, report_lang, progress_cb=None):
     aggregated_contexts = []
-    context_sources = []
+    context_sources = [] # Store original URLs for bibliography
     all_search_queries = []
     iteration = 0
     progress = []
 
     async with aiohttp.ClientSession() as session:
-        new_search_queries = await generate_search_queries(user_query)
+        # Step 1: initial queries
+        new_search_queries = await generate_search_queries(user_query, search_lang)
         if not new_search_queries:
-            progress.append("LLM did not return initial search queries.")
-            if progress_cb: progress_cb(progress, [], [])
-            return {"progress": progress, "report": "No report generated."}
+            progress.append("LLM nu a returnat interogări de căutare.")
+            return {"progress": progress, "report": "Niciun raport generat."}
         all_search_queries.extend(new_search_queries)
 
         while iteration < iter_limit:
-            progress.append(f"Iteration {iteration+1}: searching and scraping...")
-            if progress_cb: progress_cb(progress, aggregated_contexts[-3:], context_sources[-3:])
+            progress.append(f"Iterația {iteration+1}: Căutare și extragere date...")
+            if progress_cb: progress_cb(progress)
 
-            # Search each query
+            # Step 2: Search each query
             search_tasks = [perform_search(q) for q in new_search_queries]
             search_results = await asyncio.gather(*search_tasks)
             unique_links = {}
@@ -213,134 +217,194 @@ async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
                     if link and link not in unique_links:
                         unique_links[link] = q
 
-            # Fetch & extract
-            link_tasks = [
-                fetch_text(session, link) for link in unique_links
-            ]
+            # Step 3: Fetch & extract each link
+            link_tasks = [fetch_text(session, link) for link in unique_links]
             pages = await asyncio.gather(*link_tasks)
             context_tasks = [
-                evaluate_and_extract(user_query, unique_links[link], pages[i])
+                evaluate_and_extract(user_query, unique_links[link], pages[i], report_lang)
                 for i, link in enumerate(unique_links)
             ]
             link_contexts = await asyncio.gather(*context_tasks)
-            useful_contexts = []
-            useful_sources = []
+
+            useful_contexts_this_iter = []
+            useful_sources_this_iter = []
             for i, c in enumerate(link_contexts):
                 if c:
-                    aggregated_contexts.append(c)
-                    context_sources.append(list(unique_links.keys())[i])
-                    useful_contexts.append(c)
-                    useful_sources.append(list(unique_links.keys())[i])
-            if useful_contexts:
-                progress.append(f"Found {len(useful_contexts)} useful contexts this iteration.")
-            else:
-                progress.append("No useful contexts found.")
-            if progress_cb: progress_cb(progress, aggregated_contexts[-3:], context_sources[-3:])
+                    useful_contexts_this_iter.append(c)
+                    useful_sources_this_iter.append(list(unique_links.keys())[i])
 
-            # More queries or finish?
-            new_search_queries = await get_new_search_queries(user_query, all_search_queries, aggregated_contexts)
+            if useful_contexts_this_iter:
+                aggregated_contexts.extend(useful_contexts_this_iter)
+                context_sources.extend(useful_sources_this_iter)
+                progress.append(f"Context util extras: {len(useful_contexts_this_iter)} surse noi.")
+            else:
+                progress.append("Niciun context util găsit în această iterație.")
+            if progress_cb: progress_cb(progress)
+
+            # Step 4: More queries or finish?
+            new_search_queries = await get_new_search_queries(user_query, all_search_queries, aggregated_contexts, search_lang)
             if new_search_queries == "<done>":
-                progress.append("LLM decided to stop searching (enough context).")
-                if progress_cb: progress_cb(progress, aggregated_contexts[-3:], context_sources[-3:])
+                progress.append("LLM a decis să oprească (suficiente date).")
                 break
             elif new_search_queries:
-                progress.append("LLM provided new search queries.")
+                progress.append("LLM a propus noi interogări.")
                 all_search_queries.extend(new_search_queries)
             else:
-                progress.append("LLM did not provide further queries. Stopping.")
-                if progress_cb: progress_cb(progress, aggregated_contexts[-3:], context_sources[-3:])
+                progress.append("LLM nu a oferit alte interogări. Stop.")
                 break
             iteration += 1
 
-        # Final report
-        progress.append("Generating final report via LLM.")
-        if progress_cb: progress_cb(progress, aggregated_contexts[-3:], context_sources[-3:])
-        report = await generate_final_report(user_query, aggregated_contexts, context_sources)
-        progress.append("Done.")
-        if progress_cb: progress_cb(progress, aggregated_contexts[-3:], context_sources[-3:])
+        # Step 5: Final report generation
+        progress.append("Se generează raportul final...")
+        if progress_cb: progress_cb(progress)
+        report = await generate_final_report(user_query, aggregated_contexts, report_lang, context_sources)
+        progress.append("Gata.")
+        if progress_cb: progress_cb(progress)
     return {"progress": progress, "report": report}
 
-# --- HTML vizual pentru raport (format markdown split pe secțiuni, cu bibliografie curățată) ---
+# --- Visual Formatting and PDF Generation ---
 def format_report_html(markdown_text):
-    import re
-    from markdown import markdown
-
-    # Extrage secțiunea "Bibliografie" (sau similar)
-    bib_section = ""
-    bib_block = re.search(r"(#+\s*Bibliografie\s*[\r\n]+)([\s\S]+)$", markdown_text, re.IGNORECASE)
-    if bib_block:
-        bib_section = bib_block.group(2)
-        markdown_text = markdown_text[:bib_block.start()]
-        # Extragem referințe gen [1] url sau linii cu linkuri
-        bib_lines = re.findall(r"\[([0-9]+)\]\s*([^\s\[\]]+)", bib_section)
-        bib_html = "<ul class='biblio-list'>"
-        for n, url in bib_lines:
-            bib_html += f"<li><b>[{n}]</b> <a href='{url}' target='_blank'>{url}</a></li>"
-        bib_html += "</ul>"
-    else:
-        bib_html = ""
-
-    # Curățare markdown redundanțe și fence
-    markdown_text = re.sub(r'(```markdown[\r\n]*)+', '', markdown_text)
+    # Remove all code fences globally for cleaner HTML
+    markdown_text = re.sub(r'(```[\w\s]*\n)+', '', markdown_text)
+    # Normalize multiple newlines to single newlines
     markdown_text = re.sub(r'\n{3,}', '\n\n', markdown_text)
-    markdown_text = re.sub(r'(\n#+ .+?)(\n#+ .+?)', r'\1', markdown_text)  # elimină titlurile consecutive duplicate
 
-    # Spargem pe secțiuni (Titlu, Executive Summary etc.)
-    section_blocks = re.split(r'(?m)^#+ (.+)$', markdown_text)
+    # Split report into sections based on markdown headers
+    # This regex is more robust to capture the header and its subsequent content
+    sections = re.split(r"(?m)^(#{1,6}\s.*)$", markdown_text, flags=re.MULTILINE)
+
     html_parts = []
-    for i in range(1, len(section_blocks), 2):
-        header = section_blocks[i]
-        body = section_blocks[i+1]
-        if header.lower().startswith('bibliografie'):
-            continue  # O tratăm separat
-        html_parts.append(f"<h3 class='mt-4 mb-2'>{header.strip()}</h3>")
-        html_parts.append(f"<div class='report-section mb-3'>{markdown(body.strip(), extensions=['tables', 'fenced_code', 'footnotes', 'nl2br'])}</div>")
+    current_header = None
+    for i, part in enumerate(sections):
+        if not part.strip():
+            continue
 
-    if bib_html:
-        html_parts.append("<h3 class='mt-4 mb-2'>Bibliografie</h3>")
-        html_parts.append(f"<div class='report-section mb-3'>{bib_html}</div>")
+        if re.match(r"^(#{1,6}\s.*)$", part, flags=re.MULTILINE):
+            # This is a header, store it and process the next part as its content
+            current_header = part.strip()
+        else:
+            # This is content corresponding to the last captured header
+            if current_header:
+                # Replace the markdown header with an HTML equivalent
+                # Using <h2> for main sections and <h3> for sub-sections for better hierarchy
+                if current_header.startswith("# "):
+                    html_parts.append(f"<h2 class='mt-4 mb-2 report-heading'>{current_header.replace('# ', '')}</h2>")
+                elif current_header.startswith("## "):
+                    html_parts.append(f"<h3 class='mt-3 mb-2 report-subheading'>{current_header.replace('## ', '')}</h3>")
+                else:
+                    # For other markdown headers, convert to markdown first
+                    html_parts.append(f"<div class='report-section-header'>{markdown(current_header.strip())}</div>")
+
+                html_parts.append(f"<div class='report-section mb-3'>{markdown(part.strip(), extensions=['tables', 'fenced_code', 'footnotes', 'nl2br'])}</div>")
+                current_header = None # Reset for the next section
+            else:
+                # This handles content before the first header or if there are unheaded paragraphs
+                html_parts.append(f"<div class='report-section mb-3'>{markdown(part.strip(), extensions=['tables', 'fenced_code', 'footnotes', 'nl2br'])}</div>")
 
     return "\n".join(html_parts)
 
-# --- Flask Web UI ---
+def generate_pdf_from_html(html_content, query_title="Raport LLM"):
+    if not HTML:
+        raise RuntimeError("WeasyPrint nu este instalat. Asigură-te că ai instalat 'weasyprint'.")
 
+    # Add basic HTML structure and styling for PDF
+    pdf_template = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{query_title}</title>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: 'DejaVu Sans', Arial, sans-serif; margin: 40px; line-height: 1.6; color: #333; }}
+            h1, h2, h3, h4, h5, h6 {{ color: #274690; margin-top: 1.5em; margin-bottom: 0.5em; }}
+            h1 {{ font-size: 2.2em; text-align: center; margin-bottom: 1em; }}
+            h2 {{ font-size: 1.8em; border-bottom: 2px solid #eee; padding-bottom: 5px; }}
+            h3 {{ font-size: 1.4em; }}
+            p {{ margin-bottom: 1em; }}
+            ul {{ list-style-type: disc; margin-left: 20px; margin-bottom: 1em; }}
+            ol {{ list-style-type: decimal; margin-left: 20px; margin-bottom: 1em; }}
+            a {{ color: #007bff; text-decoration: none; }}
+            a:hover {{ text-decoration: underline; }}
+            .report-section {{ background: #f9f9f9; border-radius: 5px; padding: 15px; margin-bottom: 1em; border: 1px solid #ddd; }}
+            .biblio-list {{ list-style: none; padding: 0; }}
+            .biblio-list li {{ margin-bottom: 0.5em; }}
+            .page-break {{ page-break-before: always; }}
+        </style>
+    </head>
+    <body>
+        <h1>{query_title}</h1>
+        {html_content}
+    </body>
+    </html>
+    """
+    pdf_io = io.BytesIO()
+    HTML(string=pdf_template, base_url=os.getcwd()).write_pdf(pdf_io)
+    pdf_io.seek(0)
+    return pdf_io
+
+# --- Flask App ---
 app = Flask(__name__)
-TASKS = {}
+TASKS = {} # Dictionary to hold ongoing research tasks
 
+# --- HTML Templates ---
 FORM_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <title>LLM Research Web App</title>
-<link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+<link rel="stylesheet" href="[https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css](https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css)">
 <style>
 body {background:#f7f8fa;}
 .card {margin:50px auto; max-width:700px;}
-#progressBox {background:#23272b;color:#fff;padding:12px 16px;border-radius:8px;margin-top:1.5rem;display:none}
+#progressBox {background:#23272b;color:#fff;padding:12px 16px;border-radius:8px;margin-top:1.5rem;display:none; overflow-y: auto; max-height: 200px;}
 </style>
 </head>
 <body>
 <div class="card shadow">
- <div class="card-body">
-   <h2 class="card-title mb-4">Research Web Assistant (Gemini & Mistral)</h2>
-   <form id="main-form" method="POST" action="/start">
-     <div class="form-group">
-       <label for="query">Your research query / topic</label>
-       <textarea name="query" id="query" class="form-control" required rows="3"></textarea>
-     </div>
-     <div class="form-group">
-       <label for="iterations">Max iterations (default 2)</label>
-       <input type="number" name="iterations" id="iterations" class="form-control" min="1" value="2"/>
-     </div>
-     <button type="submit" class="btn btn-primary">Start research</button>
-   </form>
-   <div id="progressBox"></div>
- </div>
+    <div class="card-body">
+        <h2 class="card-title mb-4">LLM Research Web Assistant</h2>
+        <form id="main-form" method="POST" action="/start">
+            <div class="form-group">
+                <label for="query">Subiect / întrebare de cercetare</label>
+                <textarea name="query" id="query" class="form-control" required rows="3"></textarea>
+            </div>
+            <div class="form-row">
+                <div class="form-group col-md-6">
+                    <label for="search_lang">Limba pentru căutări pe web</label>
+                    <select name="search_lang" id="search_lang" class="form-control">
+                        <option value="română">Română</option>
+                        <option value="engleză">Engleză</option>
+                        <option value="germană">Germană</option>
+                        <option value="franceză">Franceză</option>
+                        <option value="spaniolă">Spaniolă</option>
+                        <option value="italiană">Italiană</option>
+                    </select>
+                </div>
+                <div class="form-group col-md-6">
+                    <label for="report_lang">Limba raportului final</label>
+                    <select name="report_lang" id="report_lang" class="form-control">
+                        <option value="română">Română</option>
+                        <option value="engleză">Engleză</option>
+                        <option value="germană">Germană</option>
+                        <option value="franceză">Franceză</option>
+                        <option value="spaniolă">Spaniolă</option>
+                        <option value="italiană">Italiană</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="iterations">Număr maxim de iterații (default 2)</label>
+                <input type="number" name="iterations" id="iterations" class="form-control" min="1" value="2"/>
+            </div>
+            <button type="submit" class="btn btn-primary">Start research</button>
+        </form>
+        <div id="progressBox"></div>
+    </div>
 </div>
 <script>
 document.getElementById('main-form').onsubmit = function() {
-  document.getElementById('progressBox').style.display = "block";
-  document.getElementById('progressBox').innerHTML = "Starting...";
+    document.getElementById('progressBox').style.display = "block";
+    document.getElementById('progressBox').innerHTML = "Se procesează... Așteptați...";
 };
 </script>
 </body>
@@ -351,30 +415,57 @@ RESULT_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>Research Report</title>
-<link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+<title>Raport de cercetare</title>
+<link rel="stylesheet" href="[https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css](https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css)">
 <style>
 body{background:#f7f8fa;}
-.card{margin-top:40px;}
-.report-section {background:#fff;border-radius:7px;box-shadow:0 0 8px #dbe3ea;padding:18px;margin-bottom:1rem;}
-h2, h3 {color:#274690;}
-pre {background: #eef2fb;}
-.biblio-list li {margin-bottom:5px;}
+.container {margin-top:40px;}
+.card {box-shadow:0 4px 8px rgba(0,0,0,0.1);}
+.report-section {
+    background:#fff;
+    border-radius:7px;
+    box-shadow:0 0 8px rgba(219,227,234,0.5); /* Lighter shadow */
+    padding:20px; /* More padding */
+    margin-bottom:1.5rem; /* More space between sections */
+    border-left: 5px solid #274690; /* Accent border */
+}
+.report-heading, .report-subheading {color:#274690; font-weight: bold; margin-bottom: 0.8em;}
+h1 {font-size: 2.2em; text-align: center; margin-bottom: 1em; color: #274690;}
+h2 {font-size: 1.8em; border-bottom: 2px solid #eee; padding-bottom: 5px;}
+h3 {font-size: 1.4em;}
+pre {background: #eef2fb; padding: 10px; border-radius: 5px; overflow-x: auto;}
+.biblio-list { list-style: none; padding: 0; }
+.biblio-list li { margin-bottom: 0.5em; }
+.biblio-list li b { color: #555; } /* Style for citation numbers */
 </style>
 </head>
 <body>
-<div class="container mt-5">
-  <div class="card shadow"><div class="card-body">
-    <h4>Query:</h4>
-    <p><b>{{ query }}</b></p>
-    <h5>Progress:</h5>
-    <ul>{% for item in progress %}<li>{{item}}</li>{% endfor %}</ul>
-    <h4 class="mt-4 mb-3">Research Report</h4>
-    <div id="report">
-      {{ report_html|safe }}
+<div class="container">
+    <div class="card shadow">
+        <div class="card-body">
+            <h1 class="card-title text-center mb-4">Raport de Cercetare LLM</h1>
+            <h4 class="mb-3">Întrebare:</h4>
+            <p class="lead"><b>{{ query }}</b></p>
+            <h5 class="mt-4 mb-3">Progresul cercetării:</h5>
+            <ul class="list-group mb-4">
+                {% for item in progress %}
+                    <li class="list-group-item list-group-item-action">{{item}}</li>
+                {% endfor %}
+            </ul>
+            <h2 class="mt-5 mb-4 text-center">Raport Final</h2>
+            <div id="report-content">
+                {{ report_html|safe }}
+            </div>
+            <hr class="my-5">
+            <div class="d-flex justify-content-center">
+                <form method="get" action="/download_pdf">
+                    <input type="hidden" name="task_id" value="{{ task_id }}"/>
+                    <button class="btn btn-success btn-lg mx-2">Descarcă PDF</button>
+                </form>
+                <a href="/" class="btn btn-secondary btn-lg mx-2">Cercetare nouă</a>
+            </div>
+        </div>
     </div>
-    <a href="/" class="btn btn-link mt-3">New research</a>
-  </div></div>
 </div>
 </body>
 </html>
@@ -382,90 +473,131 @@ pre {background: #eef2fb;}
 
 @app.route("/", methods=["GET"])
 def index():
-    return render_template_string(FORM_HTML)
-
-from functools import partial
+    return FORM_HTML
 
 @app.route("/start", methods=["POST"])
 def start():
-    user_query = request.form.get("query", "").strip()
-    iter_limit = int(request.form.get("iterations", 2))
-    task_id = str(hash(user_query + str(iter_limit)))
-    TASKS[task_id] = {"progress": [], "done": False, "result": "", "query": user_query, "contexts": [], "sources": []}
-    def progress_cb(proglist, last_ctx=None, last_src=None):
-        TASKS[task_id]["progress"] = proglist.copy()
-        if last_ctx: TASKS[task_id]["contexts"] = last_ctx
-        if last_src: TASKS[task_id]["sources"] = last_src
-    def background_run():
+    query = request.form.get("query")
+    iterations = int(request.form.get("iterations", 2))
+    search_lang = request.form.get("search_lang", "română")
+    report_lang = request.form.get("report_lang", "română")
+
+    # Generate a unique task ID
+    task_id = str(int(time.time() * 1000000))
+    TASKS[task_id] = {"status": "running", "progress": [], "result": None, "html": None, "query": query}
+
+    def progress_cb(prog):
+        TASKS[task_id]["progress"] = list(prog)
+
+    # Run the research pipeline in a separate thread
+    def run_task():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(full_research_pipeline(user_query, iter_limit, progress_cb))
-        TASKS[task_id]["done"] = True
-        TASKS[task_id]["result"] = result
-    threading.Thread(target=background_run, daemon=True).start()
+        res = loop.run_until_complete(
+            full_research_pipeline(query, iterations, search_lang, report_lang, progress_cb=progress_cb)
+        )
+        TASKS[task_id]["status"] = "done"
+        TASKS[task_id]["result"] = res
+        TASKS[task_id]["html"] = format_report_html(res["report"])
+
+    thread = threading.Thread(target=run_task)
+    thread.start()
+
     return render_template_string("""
-      <html>
-      <head>
-      <meta http-equiv="refresh" content="2; URL=/progress?task_id={{task_id}}">
-      <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-      </head>
-      <body>
-      <div class='container mt-4'>
-        <h4>Started research…</h4>
-        <p><a href="/progress?task_id={{task_id}}">Click here if not redirected</a></p>
-      </div>
-      </body></html>
+    <!DOCTYPE html>
+    <html><head><title>Se procesează...</title>
+    <link rel="stylesheet" href="[https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css](https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css)">
+    <style>#progressBox{background:#23272b;color:#fff;padding:12px 16px;border-radius:8px;margin-top:1.5rem; overflow-y: auto; max-height: 200px;}</style>
+    <script>
+    let interval = setInterval(async function(){
+        let r = await fetch('/progress?task_id={{task_id}}');
+        let data = await r.json();
+        if(data.status === "done"){
+            clearInterval(interval);
+            window.location = "/result?task_id={{task_id}}";
+        } else {
+            document.getElementById('progressBox').innerHTML =
+                '<b>Progres:</b><ul class="list-unstyled">' + data.progress.map(x=>'<li>'+x+'</li>').join('') + '</ul>';
+        }
+    }, 2000);
+    </script>
+    </head>
+    <body>
+    <div class="container mt-5">
+        <div class="card shadow">
+            <div class="card-body">
+                <h3>Se procesează interogarea...</h3>
+                <p>Acest proces poate dura câteva minute, în funcție de complexitatea întrebării și numărul de iterații.</p>
+                <div id="progressBox">Așteptați...</div>
+            </div>
+        </div>
+    </div>
+    </body>
+    </html>
     """, task_id=task_id)
 
 @app.route("/progress")
 def progress():
-    from markupsafe import escape
     task_id = request.args.get("task_id")
-    info = TASKS.get(task_id)
-    if not info:
-        return "Task not found."
-    if not info["done"]:
-        partial_ctx = []
-        last_contexts = info.get("contexts", [])
-        last_sources = info.get("sources", [])
-        if last_contexts:
-            for i, ctx in enumerate(last_contexts[:3]):
-                preview = ctx[:300] + ('...' if len(ctx) > 300 else '')
-                url = last_sources[i] if i < len(last_sources) else ""
-                partial_ctx.append(f"<div class='preview-block'><b>Context {i+1}:</b> <span style='color:#444'>{escape(preview)}</span> <br><i style='font-size:smaller'>Sursa: <a href='{escape(url)}' target='_blank'>{escape(url[:60])}...</a></i></div>")
-        return render_template_string("""
-            <html>
-            <head>
-            <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-            <style>
-              .preview-block {background: #f4f8fc; border-radius: 6px; margin: 6px 0; padding: 8px;}
-            </style>
-            <meta http-equiv="refresh" content="2; URL=/progress?task_id={{task_id}}">
-            </head>
-            <body>
-            <div class='container mt-4'>
-              <h4>Progress:</h4>
-              <ul>{% for item in progress %}<li>{{item}}</li>{% endfor %}</ul>
-              <h5>Preview contexte utile extrase (max 3):</h5>
-              {{ ctx_html|safe }}
-              <div>(refreshing...)</div>
-            </div>
-            </body></html>
-        """, progress=info["progress"], ctx_html="".join(partial_ctx), task_id=task_id)
-    result = info["result"]
-    report_html = format_report_html(result["report"])
-    return render_template_string(RESULT_HTML,
-        query=info.get("query", ""),
-        progress=result["progress"],
-        report_html=report_html)
+    t = TASKS.get(task_id, {})
+    return {"status": t.get("status", "unknown"), "progress": t.get("progress", [])}
 
-def run_flask():
-    print(f"\n --- Running Flask app at http://127.0.0.1:{PORT}/ ---")
-    app.run(port=PORT, debug=False, use_reloader=False)
+@app.route("/result")
+def result():
+    task_id = request.args.get("task_id")
+    t = TASKS.get(task_id, {})
+    html = t.get("html") or "<i>Nu există raport.</i>"
+    res = t.get("result", {})
+    query = t.get("query", "-")
+    progress_list = res.get("progress", [])
+    return render_template_string(RESULT_HTML, report_html=html, task_id=task_id, progress=progress_list, query=query)
 
-if __name__ == "__main__":
+@app.route("/download_pdf")
+def download_pdf():
+    task_id = request.args.get("task_id")
+    t = TASKS.get(task_id, {})
+    html_content = t.get("html", "")
+    query_title = f"Raport_{t.get('query', 'Cercetare')[:20].replace(' ', '_')}" # Simple title for PDF filename
+
+    if not html_content or not HTML:
+        return "Eroare PDF: Raport indisponibil sau librăria WeasyPrint nu este instalată. Vă rugăm să instalați WeasyPrint (pip install weasyprint).", 400
+
+    try:
+        pdf_io = generate_pdf_from_html(html_content, query_title=query_title)
+        return send_file(pdf_io, as_attachment=True, download_name=f"{query_title}.pdf", mimetype="application/pdf")
+    except Exception as e:
+        print(f"Error generating PDF: {e}")
+        return f"Eroare la generarea PDF-ului: {e}", 500
+
+# --- Launch via ngrok (optional) ---
+def run_app():
     if NGROK_TOKEN:
         ngrok.set_auth_token(NGROK_TOKEN)
-        url = ngrok.connect(PORT, "http", hostname=NGROK_HOSTNAME if NGROK_HOSTNAME else None)
-        print("Public URL:", url)
-    run_flask()
+        # Check if an existing tunnel is already open on the specified port
+        # This prevents "address already in use" errors if ngrok was not properly closed
+        try:
+            tunnels = ngrok.get_tunnels()
+            for tunnel in tunnels:
+                if f"http://localhost:{PORT}" in tunnel.public_url or f"tcp://0.0.0.0:{PORT}" in tunnel.public_url:
+                    print(f"Ngrok tunnel already exists for port {PORT}: {tunnel.public_url}")
+                    return
+        except Exception as e:
+            print(f"Could not check existing ngrok tunnels: {e}")
+
+        try:
+            public_url = ngrok.connect(PORT, "http", hostname=NGROK_HOSTNAME).public_url
+            print(f"Ngrok public URL: {public_url}")
+        except Exception as e:
+            print(f"Failed to connect to ngrok: {e}. Running Flask locally.")
+            public_url = None
+    else:
+        public_url = None
+        print("NGROK_TOKEN not set. Running Flask locally.")
+
+    print(f"Flask app running on [http://127.0.0.1](http://127.0.0.1):{PORT}")
+    if public_url:
+        print(f"Access via public URL: {public_url}")
+    app.run(host="0.0.0.0", port=PORT)
+
+if __name__ == "__main__":
+    run_app()
