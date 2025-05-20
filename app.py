@@ -25,33 +25,22 @@ NGROK_HOSTNAME = os.getenv("NGROK_HOSTNAME", None)
 GEMINI_MODEL = "gemini-2.0-flash"
 MISTRAL_MODEL = "mistral-large-latest"
 
-# --- Rate Limiters ---
-class RateLimiter:
-    def __init__(self, min_interval_s):
-        self.min_interval_s = min_interval_s
-        self.last_call = 0
-        self.lock = threading.Lock()
-    def wait(self):
-        with self.lock:
-            now = time.time()
-            elapsed = now - self.last_call
-            if elapsed < self.min_interval_s:
-                time.sleep(self.min_interval_s - elapsed)
-            self.last_call = time.time()
-
+# --- Async Rate Limiter cu backoff la 429 ---
 class AsyncRateLimiter:
     def __init__(self, min_interval_s):
         self.min_interval_s = min_interval_s
         self._last_call = 0
+        self._lock = asyncio.Lock()
     async def wait(self):
-        now = time.time()
-        elapsed = now - self._last_call
-        if elapsed < self.min_interval_s:
-            await asyncio.sleep(self.min_interval_s - elapsed)
-        self._last_call = time.time()
+        async with self._lock:
+            now = time.time()
+            elapsed = now - self._last_call
+            if elapsed < self.min_interval_s:
+                await asyncio.sleep(self.min_interval_s - elapsed)
+            self._last_call = time.time()
 
-gemini_async_limiter = AsyncRateLimiter(4.0)    # 15 RPM = 4s
-mistral_async_limiter = AsyncRateLimiter(1.0)   # 1s pentru siguranță
+gemini_async_limiter = AsyncRateLimiter(4.0)
+mistral_async_limiter = AsyncRateLimiter(1.5)
 
 # --- Init LLM clients ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -60,23 +49,32 @@ mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 def combine_messages(messages):
     return "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages])
 
-# --- LLM Fallback, cu rate limit ---
-async def call_llm(messages):
+# --- LLM fallback, cu retry exponential la 429 ---
+async def call_llm(messages, max_retries=4, initial_wait=6):
     prompt = combine_messages(messages)
-    try:
-        await gemini_async_limiter.wait()
-        resp = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
-        reply = resp.text.strip()
-        if reply:
-            return reply
-        else:
+    # Gemini
+    for attempt in range(max_retries):
+        try:
+            await gemini_async_limiter.wait()
+            resp = await asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model=GEMINI_MODEL,
+                contents=prompt
+            )
+            reply = getattr(resp, "text", None)
+            if reply and reply.strip():
+                return reply.strip()
             raise Exception("Empty Gemini reply")
-    except Exception as e:
-        print("[Fallback] Gemini failed, try Mistral:", e)
+        except Exception as e:
+            error_str = str(e)
+            if "RESOURCE_EXHAUSTED" in error_str or "429" in error_str:
+                print(f"[Gemini 429] Wait & retry ({attempt+1}) ...")
+                await asyncio.sleep(initial_wait * (attempt + 1)) # backoff
+            else:
+                print("[Fallback] Gemini failed, try Mistral:", e)
+                break  # Alt tip de eroare: nu încerca din nou
+    # Mistral fallback
+    for attempt in range(max_retries):
         try:
             await mistral_async_limiter.wait()
             mistral_resp = await asyncio.to_thread(
@@ -84,10 +82,19 @@ async def call_llm(messages):
                 model=MISTRAL_MODEL,
                 messages=messages
             )
-            return mistral_resp.choices[0].message.content.strip()
+            reply = mistral_resp.choices[0].message.content.strip()
+            if reply:
+                return reply
+            raise Exception("Empty Mistral reply")
         except Exception as ex:
-            print("[Error] Both LLMs failed:", ex)
-            return "Error: Both LLMs failed."
+            error_str = str(ex)
+            if "429" in error_str or "rate limit" in error_str.lower():
+                print(f"[Mistral 429] Wait & retry ({attempt+1}) ...")
+                await asyncio.sleep(initial_wait * (attempt + 1))
+            else:
+                print("[Error] Both LLMs failed:", ex)
+                break
+    return "Error: Both LLMs failed."
 
 # --- Async research pipeline ---
 async def generate_search_queries(user_query):
@@ -101,7 +108,6 @@ async def generate_search_queries(user_query):
         {"role": "user", "content": f"User Query: {user_query}\n\n{prompt}"}
     ]
     response = await call_llm(messages)
-    # Elimina orice delimitator de tip ```python sau ``` de la LLM
     clean = response.strip().replace('```python', '').replace('```', '').strip()
     try:
         queries = eval(clean)
@@ -173,30 +179,41 @@ async def get_new_search_queries(user_query, previous_search_queries, all_contex
         pass
     return []
 
-async def generate_final_report(user_query, all_contexts):
-    context_combined = "\n".join(all_contexts)
+# --- Generare raport cu referințe și bibliografie ---
+async def generate_final_report(user_query, all_contexts, sources):
+    contexts_for_llm = []
+    bib_entries = []
+    for idx, (context, url) in enumerate(zip(all_contexts, sources)):
+        ref = f"[{idx+1}]"
+        contexts_for_llm.append(f"{ref} {context}")
+        bib_entries.append(f"{ref} {url}")
+    bib_section = "\n".join(bib_entries)
+    context_combined = "\n\n".join(contexts_for_llm)
     prompt = (
         "You are an expert researcher and report writer. Based on the gathered contexts below and the original query, "
         "write a comprehensive, well-structured, and detailed report that addresses the query thoroughly. "
+        "In your answer, use [N] to cite each piece of information based on its source context, where N is the number of the reference. "
+        "At the end, add a separate section titled 'Bibliografie' listing all sources in the format [N] url. "
         "Use markdown for all sections: Title, Executive Summary, numbered sections, bullet lists, bold, tables if needed. "
-        "Each section (title, executive summary, introduction, main sections, conclusion) must be in its own markdown block for easy HTML parsing. "
-        "Return only markdown, no code fences or explanations."
+        "Each section (title, executive summary, introduction, main sections, conclusion, bibliografie) must be in its own markdown block for easy HTML parsing. "
+        "Return only markdown, no code fences or explanations.\n\n"
+        f"Contexts:\n{context_combined}\n\nReferences:\n{bib_section}\n"
     )
     messages = [
         {"role": "system", "content": "You are a skilled report writer."},
-        {"role": "user", "content": f"User Query: {user_query}\n\nContexts:\n{context_combined}\n\n{prompt}"}
+        {"role": "user", "content": f"User Query: {user_query}\n\n{prompt}"}
     ]
     return await call_llm(messages)
 
-# --- Async research orchestrator ---
+# --- Async research orchestrator cu referințe ---
 async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
     aggregated_contexts = []
+    context_sources = []
     all_search_queries = []
     iteration = 0
     progress = []
 
     async with aiohttp.ClientSession() as session:
-        # Step 1: initial queries
         new_search_queries = await generate_search_queries(user_query)
         if not new_search_queries:
             progress.append("LLM did not return initial search queries.")
@@ -206,8 +223,6 @@ async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
         while iteration < iter_limit:
             progress.append(f"Iteration {iteration+1}: searching and scraping...")
             if progress_cb: progress_cb(progress)
-
-            # Step 2: search each query
             search_tasks = [perform_search(q) for q in new_search_queries]
             search_results = await asyncio.gather(*search_tasks)
             unique_links = {}
@@ -216,8 +231,6 @@ async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
                 for link in links:
                     if link and link not in unique_links:
                         unique_links[link] = q
-
-            # Step 3: fetch & extract each link
             link_tasks = [
                 fetch_text(session, link) for link in unique_links
             ]
@@ -227,15 +240,15 @@ async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
                 for i, link in enumerate(unique_links)
             ]
             link_contexts = await asyncio.gather(*context_tasks)
-            useful_contexts = [c for c in link_contexts if c]
-            if useful_contexts:
-                aggregated_contexts.extend(useful_contexts)
-                progress.append(f"Found {len(useful_contexts)} useful contexts this iteration.")
+            for i, c in enumerate(link_contexts):
+                if c:
+                    aggregated_contexts.append(c)
+                    context_sources.append(list(unique_links.keys())[i])
+            if aggregated_contexts:
+                progress.append(f"Found {len(aggregated_contexts)} useful contexts this iteration.")
             else:
                 progress.append("No useful contexts found.")
             if progress_cb: progress_cb(progress)
-
-            # Step 4: more queries or finish?
             new_search_queries = await get_new_search_queries(user_query, all_search_queries, aggregated_contexts)
             if new_search_queries == "<done>":
                 progress.append("LLM decided to stop searching (enough context).")
@@ -247,11 +260,9 @@ async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
                 progress.append("LLM did not provide further queries. Stopping.")
                 break
             iteration += 1
-
-        # Step 5: final report
         progress.append("Generating final report via LLM.")
         if progress_cb: progress_cb(progress)
-        report = await generate_final_report(user_query, aggregated_contexts)
+        report = await generate_final_report(user_query, aggregated_contexts, context_sources)
         progress.append("Done.")
         if progress_cb: progress_cb(progress)
     return {"progress": progress, "report": report}
@@ -260,16 +271,22 @@ async def full_research_pipeline(user_query, iter_limit, progress_cb=None):
 def format_report_html(markdown_text):
     import re
     from markdown import markdown
-    # Sparge pe secțiuni principale (titlu, summary, etc) dacă există "#", "##", etc.
+    # Înlătură duplicate block-level (ex: titluri duble de la LLM)
+    # Sparge pe secțiuni principale (titlu, summary, etc)
     sections = re.split(r"(?m)^#+ ", markdown_text)
     headers = re.findall(r"(?m)^#+ (.+)$", markdown_text)
     blocks = []
+    titles_seen = set()
     for idx, sec in enumerate(sections):
         if not sec.strip():
             continue
         title = headers[idx-1] if idx > 0 and idx-1 < len(headers) else None
+        # Elimină duplicări de titlu/secțiuni
+        if title and title.lower() in titles_seen:
+            continue
         if title:
             blocks.append(f"<h3 class='mt-4 mb-2'>{title}</h3>")
+            titles_seen.add(title.lower())
         blocks.append(f"<div class='report-section mb-3'>{markdown(sec.strip())}</div>")
     return "\n".join(blocks)
 
@@ -352,8 +369,6 @@ pre {background: #eef2fb;}
 def index():
     return render_template_string(FORM_HTML)
 
-from functools import partial
-
 @app.route("/start", methods=["POST"])
 def start():
     user_query = request.form.get("query", "").strip()
@@ -362,7 +377,6 @@ def start():
     TASKS[task_id] = {"progress": [], "done": False, "result": "", "query": user_query}
     def progress_cb(proglist):
         TASKS[task_id]["progress"] = proglist.copy()
-    # Rulează research pipeline pe un thread separat (nu în event loop Flask!)
     def background_run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -378,7 +392,6 @@ def start():
       <div style='margin:2em'>Task started. Loading progress page...</div>
       </body></html>
       """, task_id=task_id)
-
 
 @app.route("/progress")
 def progress():
