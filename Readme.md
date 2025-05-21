@@ -74,7 +74,7 @@ Exemplu de rulare în Colab (sau terminal):
 După pornirea serverului, va apărea un link public ngrok (https://...ngrok-free.app).
 Deschide-l în browser pentru a utiliza aplicația web.
 
-🔑 Variabile de mediu necesare (.env)
+#### 🔑 Variabile de mediu necesare (.env)
 
 ```python
 GEMINI_API_KEY=your_gemini_key
@@ -86,7 +86,7 @@ NGROK_HOSTNAME=your-ngrok-subdomain.ngrok-free.app
 
     Cheile API se obțin de pe Google AI Studio (Gemini), Mistral, iar NGROK se obține de pe ngrok.com.
 
-📝 Funcționalități
+#### 📝 Funcționalități
 
     Căutare web automată pe baza întrebării date (DuckDuckGo, extragere text)
 
@@ -99,7 +99,7 @@ NGROK_HOSTNAME=your-ngrok-subdomain.ngrok-free.app
     Integrare rapidă via Colab (rulează direct în notebook!)
 
 
-🚀 Quick Start (TL;DR)
+#### 🚀 Quick Start (TL;DR)
 ```python
 !git clone https://github.com/pasatsanduadrian/OpenResearchLLM.git
 %cd OpenResearchLLM
@@ -108,4 +108,6 @@ NGROK_HOSTNAME=your-ngrok-subdomain.ngrok-free.app
 !python app.py
 ```
 
-Accesează linkul public ngrok generat și începe cercetarea!
+#### Accesează linkul public ngrok generat și începe cercetarea!
+
+
