@@ -1,9 +1,9 @@
 flask
 pyngrok
-nest_asyncio
 python-dotenv
 mistralai
-google-genai
-aiohttp
+google-generativeai
+duckduckgo-search
+weasyprint
 beautifulsoup4
-duckduckgo_search
+markdown
